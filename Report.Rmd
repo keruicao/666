@@ -1,0 +1,529 @@
+---
+title: "Modeling Mid-term Project"
+author: "Kerui Cao"
+date: "11/28/2019"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo =FALSE,dpi = 500,dev = "pdf",fig.height = 3,message=FALSE, warning=FALSE)
+pacman::p_load(tidyverse,stringr,jsonlite,Hmisc,MASS,compositions,rstanarm,bayesplot,rstan,RLRsim)
+```
+
+## Data preparation Clean
+
+\qquad I use *two dataset*, one is the dataset containing resord of the number imigrants of each states of the U.S, another one is the dataset downloaded from Yelp website, there are four sub datasets in total, I use "Business" dataset which contains the infomation of part of businesses listed on Yelp. There are 192609 businesses in this dataset, the main steps of data preparation and clean process are:  
+
++ Extract restaurant information from all these businesses;
++ Extract restaurant with more than 100 reviews;
++ Extract cities with more than 150 resturants, which can exactly give us 10 cities after filtering;
++ Delete variables with more than 40% missing value;
++ Reorganize some variables;
++ Delete observations with missing values;  
+
+```{r}
+business = stream_in(file("business.json"),verbose = FALSE,pagesize = 10000)
+business_flat = flatten(business)
+```
+
+
+```{r}
+cagu = business_flat[which(str_detect(business_flat$categories,"Restaurants")),]
+```
+
+
+```{r}
+cagu = cagu %>% filter(review_count>100)
+```
+
+
+```{r}
+# Calculate the proportion of missing value for each variable
+missing = cagu %>% apply(MARGIN = 2, function(x){round(sum(is.na(x))/length(x)*100,2)}) %>% 
+  data.frame()
+colnames(missing) = "Prop"
+
+# Find variables with more than 40% missing values
+missing = missing %>% mutate(feature = rownames(missing)) %>% filter(Prop > 40)
+del = missing$feature
+
+# Delete those variables
+cagu = dplyr::select(cagu,-del)
+```
+
+\qquad Variables "hours.Monday", "hours.Tuesday", "hours.Wednesday", "hours.Thursday", "hours.Friday", "hours.Saturday", "hours.Sunday" indicate the operational hours for each businesses, we don't need these information, so we delete these variables.  
+
+```{r}
+cagu = dplyr::select(cagu,-c("hours.Monday","hours.Tuesday","hours.Wednesday","hours.Thursday",
+                      "hours.Friday","hours.Saturday","hours.Sunday"))
+```
+
+\qquad Some variables whose value are list, for example, the value of variables "attributes.GoodForMeal" is ***{'dessert': False, 'latenight': False, 'lunch': True, 'dinner': True, 'brunch': False, 'breakfast': False}***, we simple re-define this variables as a numeric score by counting how many "True" contained, for the example above, the re-defined value is 2. We do the same for variables "attributes.BusinessParking" and "attributes.Ambience".  
+
+```{r}
+cagu = mutate(cagu,attributes.GoodForMeal = str_count(cagu$attributes.GoodForMeal,"True"))
+cagu = mutate(cagu,attributes.BusinessParking = str_count(attributes.BusinessParking,"True"))
+cagu = mutate(cagu,attributes.Ambience = str_count(attributes.Ambience,"True"))
+```
+
+\qquad For variable "categories", we can see that some restaurant contains words like "Chinese", "French" and so on, so I created new binary variables indicating those informations.  
+
+```{r}
+cagu = mutate(cagu,Chinese = ifelse(str_detect(cagu$categories,"Chinese"),1,0))
+cagu = mutate(cagu,French = ifelse(str_detect(cagu$categories,"French"),1,0))
+cagu = mutate(cagu,Mexican = ifelse(str_detect(cagu$categories,"Mexican"),1,0))
+cagu = mutate(cagu,Italian = ifelse(str_detect(cagu$categories,"Italian"),1,0))
+cagu = mutate(cagu,Indian = ifelse(str_detect(cagu$categories,"Indian"),1,0))
+cagu = mutate(cagu,Japanese = ifelse(str_detect(cagu$categories,"Japanese"),1,0))
+cagu = mutate(cagu,American = ifelse(str_detect(cagu$categories,"American"),1,0))
+```
+
+\qquad Some binary variables contain value "True" and "False" and "None", but only a small part of them are "None", so I simply delete them.  
+
+\qquad Some variables contain value like "u'average'", we need to transforme it into only "average".  
+
+
+
+```{r}
+cagu = cagu %>% mutate(attributes.Caters = ifelse(cagu$attributes.Caters == 
+                       "None",NA, as.character(cagu$attributes.Caters)))
+cagu = cagu %>% mutate(attributes.BusinessAcceptsCreditCards = 
+                         ifelse(cagu$attributes.BusinessAcceptsCreditCards == 
+                       "None",NA,as.character(cagu$attributes.BusinessAcceptsCreditCards)))
+```
+
+```{r}
+pat = "(?<=').*?(?=')"
+cagu = cagu %>% mutate(attributes.NoiseLevel = 
+                         str_extract(attributes.NoiseLevel,pattern = pat))
+cagu = cagu %>% mutate(attributes.WiFi = 
+                         str_extract(attributes.WiFi,pattern = pat))
+cagu = cagu %>% mutate(attributes.Alcohol = 
+                         str_extract(attributes.Alcohol,pattern = pat))
+cagu = cagu %>% mutate(attributes.RestaurantsAttire = 
+                         str_extract(attributes.RestaurantsAttire,pattern = pat))
+
+cagu = drop_na(cagu)
+
+cagu = mutate(cagu,
+              attributes.GoodForKids = ifelse(attributes.GoodForKids=="True",1,0),
+              attributes.RestaurantsReservations = ifelse(attributes.RestaurantsReservations=="True",1,0),
+              attributes.Caters = ifelse(attributes.Caters=="True",1,0),
+              attributes.RestaurantsTakeOut = ifelse(attributes.RestaurantsTakeOut=="True",1,0),
+              attributes.OutdoorSeating = ifelse(attributes.OutdoorSeating=="True",1,0),
+              attributes.BikeParking = ifelse(attributes.BikeParking=="True",1,0),
+              attributes.HasTV = ifelse(attributes.HasTV=="True",1,0),
+              attributes.RestaurantsGoodForGroups = ifelse(attributes.RestaurantsGoodForGroups=="True",1,0),
+              attributes.RestaurantsDelivery = ifelse(attributes.RestaurantsDelivery=="True",1,0),
+              attributes.BusinessAcceptsCreditCards = ifelse(attributes.BusinessAcceptsCreditCards=="True",1,0),)
+cagu = mutate(cagu,attributes.RestaurantsPriceRange2 = as.numeric(attributes.RestaurantsPriceRange2 ))
+```
+
+```{r}
+city.list = cagu %>% count(city) %>% arrange(desc(n)) %>% filter(n>178)
+cagu = cagu[which(cagu$city %in% city.list$city),]
+```
+
+```{r}
+imi = read.csv("imigrates.csv")
+imi.c = imi %>% filter(`Origin..tooltip.` == c("China:","France","Mexico","Italy","India","Japan"))
+imi.c = imi.c %>% droplevels()
+imi.c = imi.c %>% mutate(MSA = str_extract(imi.c$MSA,pattern = ", \\w*") %>% gsub(pattern = ", ",replacement = ""),
+                         `Origin..tooltip.` = gsub(imi.c$`Origin..tooltip.`,pattern = ":",replacement = ""))
+imi.f = imi.c %>% dplyr::select("ï..Round.total.MSA.population","Immigrants","MSA","Origin..tooltip.")
+names(imi.f) = c("Total.Population","Immigrants","MSA","Origin")
+tot = imi.f %>% group_by(MSA) %>% summarise(tot = sum(Total.Population,na.rm = T))
+imi = imi.f %>% group_by(MSA,Origin) %>% summarise(imi = sum(Immigrants)) %>% pivot_wider(names_from = Origin,values_from = imi)
+imi = impute(imi,0)
+imi = inner_join(imi,tot,by = "MSA")
+imi = imi %>% mutate(China.p = China/tot,
+                     India.p = India/tot,
+                     Italy.p = Italy/tot,
+                     Japan.p = Japan/tot,
+                     France.p = France/tot,
+                     Mexico.p = Mexico/tot) %>% dplyr::select(-c(tot,China,India,Italy,Japan,France,Mexico))
+```
+
+```{r}
+cagu.h = left_join(x = cagu,y = imi,by = c("state" = "MSA")) %>% drop_na()
+```
+
+\newpage
+
+## EDA
+
+\qquad Our research interest lies on the star rating for each restaurants, so we try to apply exploratory data analysis around star ratings of restaurants.  
+
+\qquad First we will see the distributions of star ratings of restaurants, and we are also interested in the difference of distributions across cities.  
+
+```{r}
+a = cagu.h %>% group_by(city) %>% summarise(average = mean(stars),
+                                            max = max(stars),
+                                            min = min(stars)) %>% mutate(id = 1:length(min))
+
+a1 = ggplot(a) + geom_pointrange(aes(x = id,y = average,ymin = min,ymax = max))+
+  scale_x_discrete(breaks = NULL) + xlab("City")
+a2 = ggplot(cagu.h) +
+ aes(x = stars, fill = city) +
+ geom_density(adjust = 1L,alpha = 0.2) +
+ scale_fill_hue() +
+ theme(legend.position = "")+ xlab("Star Rating")
+
+a3 = ggplot(cagu.h)+geom_violin(aes(y = stars,x = city))+ scale_x_discrete(breaks = NULL)+ xlab("City")
+
+gridExtra::grid.arrange(gridExtra::arrangeGrob(a1,a3,nrow = 1),a2,ncol = 1)
+```
+
+\qquad Above plot shows the distribution of star ratings, as for the upper left plot, black points are the average star ratings for selected ten city, vertical lines shows the range of star ratings, upper right plot is the violin plot of star ratings of each cities, lower plot shows the density of star ratings in for each cities. We can tell that restaurants in different cities have similar didtribution, which is centering at 4 stars, and barely seeing restaurants with lower than 2 stars. So we may consider that there is no difference between cities.  
+
+\qquad We consider that maybe city is not a good standard to separate and group restaurants, so I tried to separate and group restaurants by districts, which can be indicated by variable "postal_code", here I first tried restaurants in Las Vegas, because we have more date from restaurants in Las Vegas, which is 1916 restaurants, and I only pick districts with more than 30 restaurants, below is part of the list of chosen districts:  
+
+```{r}
+cagu.las = cagu.h %>% filter(city == "Las Vegas")
+zip.list = cagu.las %>% count(postal_code) %>% arrange(desc(n)) %>% filter(n > 30)
+colnames(zip.list) = c("Zip.Code","Num of Restaurant")
+kableExtra::kable(zip.list[1:10,],booktabs = T,caption = "List of districts",align = "c",format = 'latex') %>% 
+  kableExtra::kable_styling(font_size = 8,bootstrap_options = 
+                  c('striped','hover','condensed',"responsive"),latex_options = "HOLD_position")
+```
+
+\qquad Do the same as grouping restaurants by cities, we drew the same plot shown below, from the plot we can tell that restaurants from different district have quite different distributions, which is more significant than the difference between grouping by cities, so district is a better standard to separate and group restaurants.  
+
+```{r}
+a.las = cagu.las %>% group_by(postal_code) %>% summarise(average = mean(stars),
+                                            max = max(stars),
+                                            min = min(stars)) %>% mutate(id = 1:length(min))
+
+a1 = ggplot(a.las) + geom_pointrange(aes(x = id,y = average,ymin = min,ymax = max))+
+  scale_x_discrete(breaks = NULL) + xlab("Districts")
+a2 = ggplot(cagu.las) +
+ aes(x = stars, fill = postal_code) +
+ geom_density(adjust = 1L,alpha = 0.2) +
+ scale_fill_hue() +
+ theme(legend.position = "")+ xlab("Star Rating")
+
+a3 = ggplot(cagu.las)+geom_boxplot(aes(y = stars,x = postal_code))+ scale_x_discrete(breaks = NULL)+ xlab("postal_code")
+
+gridExtra::grid.arrange(gridExtra::arrangeGrob(a1,a3,nrow = 1),a2,ncol = 1)
+```
+
+\qquad Than we will dive deeper into the data, we try to see the difference between distribution of star ratings between restaurants distinguished by features. I examined all 33 features, below are part of the result.  
+
+*Noise Level*
+
+```{r message=FALSE, warning=FALSE}
+ggplot(cagu.las) +
+ aes(x = stars,fill = city,color = postal_code) +
+ geom_density(adjust = 1L,alpha = 0.1) +
+ scale_fill_hue() + facet_grid(rows = vars(attributes.NoiseLevel),scales = "free_y") + theme(legend.position = "")
+```
+
+\qquad Above plot shows the distribution of stars of restaurants with different noise level across cities, we can see clearly that, ignore difference between districts, as the noise level increase, the stars center ar lower score, quiet restaurants center at 4, loud restaurants center at 3, as for the deifference between cities, we can see that most cities have similar distribution at each noise level.  
+
+*Price Range*
+
+```{r message=FALSE, warning=FALSE}
+ggplot(cagu.h) +
+aes(x = stars) +
+geom_density(adjust = 1L,alpha = 0.5,fill = 'black',color = "white") +
+scale_fill_hue() + facet_grid(cols = vars(attributes.RestaurantsPriceRange2),)
+```
+
+\qquad Above plot shows the distribution of stars of restaurants with different price range, expensive restaurants are more concentrating than cheap restaurants, but this phenomenon may be caused by small sample size of luxury restaurants.  
+
+*Chinese Restaurants*
+
+```{r}
+ggplot(cagu.las) +
+ aes(x = stars,fill = city,color = postal_code) +
+ geom_density(adjust = 1L,alpha = 0.1) +
+ scale_fill_hue() + facet_grid(rows = vars(Chinese),scales = "free_y") + theme(legend.position = "")
+```
+
+\qquad Above plot shows the distribution of star ratings of restaurant providing Chinese dishes and not providing Chinese dishes, we can see clearly that Chinese restaurants tend to have lower stars, as for the difference between districts, we can see that for some districts, Chinese restaurants center at around 4 stars rather than 3.5 stars.  
+
+\qquad I am a little interested about this phenomenon, so I will explore further.  One explaination could be the proportion of Chinese in that city may influence the star ratiings of Chinese Restaurants, so I included a new dataset containing records of imigrants numbers of each states, below is the scatter ponit plot of the proportion of Chinese in each cities and star ratings of restaurants.
+
+```{r}
+a = cagu.h%>%filter(Chinese==1)
+b = a %>% group_by(as.factor(China.p)) %>% summarise(mean = mean(stars))
+fu = function(x){
+  im = as.numeric(b[which(b$`as.factor(China.p)`==x),2])
+  return(im)
+}
+ggplot(a)+geom_violin(aes(x = factor(China.p),y = stars)) +scale_x_discrete(breaks = NULL) + xlab("Proportion of Chinese")
+```
+
+\qquad Because we have restaurants data from only 5 states, so the number of unique values of proportion of Chinese is only 5, from above plot we can see that there is no clear pattern that indicating that the star ratings of Chinese restuarants are related to the proportion of Chinese imigrants.  
+
+\qquad To further explore the reason Chinese restaurants having lower stars, and based on previous findings, we suspect that noisy restaurants will have lower stars, below plot shows the distribution of noise level of restaurants providing Chinese dishes and not providing Chinese dishes, we can see that Chinese restaurants have similar distribution and even higher proportion of quiet restaurants, so there may be some other factors. To further analyze those factors affecting star ratings, we need some models to do this.  
+
+```{r message=FALSE, warning=FALSE}
+ggplot(cagu.h) +
+ aes(x = attributes.NoiseLevel) +
+ geom_histogram(adjust = 1L,stat="count",) +
+ scale_fill_hue() + facet_grid(rows = vars(Chinese),scales = "free_y") + theme(legend.position = "")
+```
+
+\newpage
+
+## CDA
+
+\qquad First we need a rough understanding of the relationships between variables and stars, so we construct linear regression first, as for model selection, the main goal of this research is find out factors other than food quality that affect the star ratings of a resturant, and adjust the star ratings of restaurants so that it can purely reflect the food quality of a restaurants. So as for the model selection, we may have concerns that whether we should include all the potential attibutes or only those attibutes having strong evidence suuporting they will affect the star ratings of restaurants. So we will construct both models and compare the prediction result from both model, as for attibutes selection, we use backward selection.  
+
+\qquad One more important thing to notice is that I made little transformation about the attibutes indication whether a restaurant is Chinese restaurant or French or others, I did not directly put those attibutes into tht model, instead I put the interaction of those sttibutes and corresponding proportion of imigrants to the model, for example, instead of just variable "China", I put "China:Chinese.p + China" into the model.  
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+cagu.data = cagu.h %>% dplyr::select(stars,city,names(cagu.h)[13:43])
+
+fit1 = lm(data = cagu.data,scale(stars) ~ attributes.GoodForKids+
+            attributes.RestaurantsReservations+
+            attributes.GoodForMeal+
+            attributes.BusinessParking+
+            attributes.Caters+
+            attributes.NoiseLevel+
+            attributes.RestaurantsTakeOut+
+            attributes.RestaurantsPriceRange2+
+            attributes.OutdoorSeating+
+            attributes.BikeParking+
+            attributes.Ambience+
+            attributes.HasTV+
+            attributes.WiFi+
+            attributes.Alcohol+
+            attributes.RestaurantsAttire+
+            attributes.RestaurantsGoodForGroups+
+            attributes.RestaurantsDelivery+
+            attributes.BusinessAcceptsCreditCards+
+            Chinese+French+Mexican+Italian+Indian+Japanese+
+            Chinese:China.p+French:France.p+Mexican:Mexico.p+
+            Italian:Italy.p+Indian:India.p+Japanese:Japan.p)
+step = stepAIC(fit1, direction="both",trace = 0)
+```
+
+\qquad We fit the simple linear model with all attibutes, since for this model we do not care the significance of variables, the $R^2$ is $16.9\%$, which is not very good is for an model whose aim is to predict, which means our model can not capture too much information of the data, but from another perspective, we can say that all these attributes can only affect a small part of the star ratings, which means the star ratings is less bised by these attibutes. Below plot shows the QQ plot of the residual, which indicating that the residuals are not normally distributed, but it is close to normal distribution.  
+
+```{r}
+car::qqPlot(fit1$residuals, id = F)
+```
+
+\qquad We fit the model after variables selection, below is the summary of this model:
+
+```{r}
+lm.i = lm(data = cagu.data,scale(stars) ~ attributes.GoodForKids + attributes.RestaurantsReservations + 
+    attributes.GoodForMeal + attributes.BusinessParking + attributes.Caters + 
+    attributes.NoiseLevel + attributes.BikeParking + attributes.Ambience + 
+    attributes.WiFi + attributes.Alcohol + attributes.RestaurantsAttire + 
+    attributes.RestaurantsGoodForGroups + Chinese + French + 
+    Italian + Japanese + Italian:Italy.p + Japanese:Japan.p,family = gaussian())
+summary(lm.i)
+```
+
+\qquad According to the regression result, most of the selected variables are statistic significantly, which meets our requires, the result also confirmes what we find in the EDA part, load restaurants have lower average star, Chinese restaurants have lower stars, and more funny facts are shown in the result, we can see that Italian restaurants also have lower average star ratings, just like Chinese restaurants, but what is different is that if a city has higher proportion of Italian imigrants, the star ratings of Italian restaurants will be even lower, but Japanese restaurants are just the opposite, higher average star ratings and can be even higher if there are a lot of Japanese imigrants in a city.
+
+\qquad As for the $R^2$, which is $17\%$ and is slightly bigger than the model without variable selection, below is the QQ plot of this model:
+
+```{r}
+car::qqPlot(lm.i$residuals, id = F)
+```
+
+\qquad Observe this plot, we can see the it is quite similar to the one belonging to model without variable selection, so for simlicity, we want to keep the attibutes selection process. We further exam the model, below is the replicated star ratings from this model:  
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+mo.b  = stan_glm(data = cagu.data,scale(stars) ~ attributes.GoodForKids + attributes.RestaurantsReservations + 
+    attributes.GoodForMeal + attributes.BusinessParking + attributes.Caters + 
+    attributes.NoiseLevel + attributes.BikeParking + attributes.Ambience + 
+    attributes.WiFi + attributes.Alcohol + attributes.RestaurantsAttire + 
+    attributes.RestaurantsGoodForGroups + Chinese:China.p + French:France.p + 
+    Italian:Italy.p,family = gaussian())
+```
+```{r}
+rstanarm::pp_check(mo.b)
+```
+
+\qquad Observe the plot above, our model caputures the general trend of the star ratings, which is certering at 4 star and nearly normal distributed, but because the star ratings are disctete, so the limitation of model makes it lost a lot information of the data, this also suggests that we may switch from Gaussian distribution to Multinomial distribution, which is categorical regression.  
+
+\qquad As for fitting the categorical regreesion, we still keep the variable selection process that based on backward and forward selection. Below is the result of categorical:  
+
+```{r}
+# mo.mn = polr(data = cagu.data,factor(stars) ~ attributes.GoodForKids+
+#             attributes.RestaurantsReservations+
+#             attributes.GoodForMeal+
+#             attributes.BusinessParking+
+#             attributes.Caters+
+#             attributes.NoiseLevel+
+#             attributes.RestaurantsTakeOut+
+#             attributes.RestaurantsPriceRange2+
+#             attributes.OutdoorSeating+
+#             attributes.BikeParking+
+#             attributes.Ambience+
+#             attributes.HasTV+
+#             attributes.WiFi+
+#             attributes.Alcohol+
+#             attributes.RestaurantsAttire+
+#             attributes.RestaurantsGoodForGroups+
+#             attributes.RestaurantsDelivery+
+#             attributes.BusinessAcceptsCreditCards+
+#             Chinese+French+Mexican+Italian+Indian+Japanese+
+#             Chinese:China.p+French:France.p+Mexican:Mexico.p+
+#             Italian:Italy.p+Indian:India.p+Japanese:Japan.p)
+# step = stepAIC(mo.mn,trace = 0)
+```
+```{r}
+mo.mn = polr(data = cagu.data,factor(stars) ~ attributes.GoodForKids + attributes.RestaurantsReservations + 
+    attributes.GoodForMeal + attributes.BusinessParking + attributes.Caters + 
+    attributes.NoiseLevel + attributes.BikeParking + attributes.Ambience + 
+    attributes.WiFi + attributes.Alcohol + attributes.RestaurantsGoodForGroups + 
+    Chinese + French + Italian + Japanese + Italian:Italy.p)
+summary(mo.mn)
+```
+
+\qquad We can see that the result of multinomial regression still confirms our findings in EDA, load restaurants have lower average star, Chinese restaurants have lower stars, the difference between categorical regression and simple linear regression is for Japan restaurants, no strong evidence will support that higher proportion of Japanese imigrants will increase the star ratings of Japanese restaurants.  
+
+\qquad Below is the model checking, we use categorical regression model to predict the star ratings of each resturants and compare it to the observed star ratings, we can see that predicted stars from multinomial regression model are more concertrating at 4 star, original data are more evenly separated.  
+
+```{r}
+pred = predict(mo.mn)
+re = data.frame("original" = cagu.data$stars,"predict" = as.numeric(as.character(pred))) %>% pivot_longer(cols = 1:2,names_to = "type", values_to = "value")
+ggplot(re) + geom_density(aes(x = value, fill = type),alpha = 0.4)
+```
+
+\qquad Based on our EDA findings, restaurants from same district will have different distributions of star ratings, so it is better to consider multilevel model with random effect related to districts, because we also find that different cities will have similar star rating distributions, so we just construct Mixed Effect Model with in one single city, here I still choose Las Vegas for the same reason, it has most restaurants, since in a single city, the proportion of imigrants are the same for all restaurants, so I did not include them in the model. Below is the summary of fitted model:  
+
+```{r include=FALSE}
+library(brms)
+cagu.las = cagu.las[which(cagu.las$postal_code %in% zip.list$Zip.Code),]
+cagu.las$stars =  factor(cagu.las$stars,ordered = T)
+mo.mm = brm(data = cagu.las, stars ~  attributes.GoodForKids + attributes.RestaurantsReservations + 
+    attributes.GoodForMeal + attributes.BusinessParking + attributes.Caters + 
+    attributes.NoiseLevel + attributes.BikeParking + attributes.Ambience + 
+    attributes.WiFi + attributes.Alcohol + attributes.RestaurantsGoodForGroups + 
+    Chinese + French + Italian + Japanese + (1|postal_code),family = acat("logit"),
+            prior = set_prior("normal(0,5)"),cores = 4)
+```
+
+```{r}
+mo.mm.fit = mo.mm$fit
+summary(mo.mm)
+```
+
+\qquad First we have to validate this result, because we obtained this result through MCMC sampling method, so we have to check if the sampling converges, here all the $\hat{R}$ are 1, and we achieved a relatively large Efficient Sample Size, so we can tell that the MCMC sampling converges well.  
+\qquad Second, From the summary we can see that $95\%$ confidence interval of most coefficients do not contain 0, so we can conclude strong evidence supporting that most of these variables do affect the star ratings of a restaurants, and most of them are consistant with the result of our previous model, due to this is a categorical regression, so the interpretation of model will be based on possibility or odds. Example interpretation is shown below:  
+
+\qquad We take the mean of posterior distribution as the point estmator:  
+
++ $Log[\frac{P(star>1.5)}{P(star=1.5)}]$ =  -4.13 + $X\beta$  
++ $Log[\frac{P(star>2.0)}{P(star\leq2.0)}]$ =  -1.63 + $X\beta$  
++ $Log[\frac{P(star>2.5)}{P(star\leq2.5)}]$ =  -1.19 + $X\beta$  
++ $Log[\frac{P(star>3.0)}{P(star\leq3.0)}]$ =  -0.82 + $X\beta$  
++ $Log[\frac{P(star>3.5)}{P(star\leq3.5)}]$ =  -0.07 + $X\beta$  
++ $Log[\frac{P(star>4.0)}{P(star\leq4.0)}]$ =  +1.25 + $X\beta$  
++ $Log[\frac{P(star=5.0)}{P(star\leq4.5)}]$ =  +4.46 + $X\beta$  
+
+\qquad Next we can use the model to replicate a star ratings and compare it to observed star ratings, we can treat the result of comparison as model checking:  
+
+```{r}
+pp_check(mo.mm,nsamples = 100)
+```
+
+\qquad We can see that compared to non-mixed effect multinomial model, new mixed-effect multinomial model performs better, which captured most of informations of dataset.  
+
+\qquad Based on above interpretation, we can also calculate the possibility of each restaurants receiving each star ratings, below is part of the result:  
+
+```{r}
+pred = predict(mo.mm)
+kableExtra::kable(pred[1:10,],booktabs = T,caption = "Prediction",align = "c",format = 'latex') %>% 
+  kableExtra::kable_styling(font_size = 8,bootstrap_options = 
+                  c('striped','hover','condensed',"responsive"),latex_options = "HOLD_position")
+```
+
+\qquad Here our response variable are star ratings, which is ordinal, so according to theory, behind the observed star ratings, there is a continuous latent variable that dominate the observed star ratings, so here we use the expectation of above predictions as the estimation of continuous latent variable:  
+
+```{r}
+cho = matrix(data = c(1.5,2,2.5,3,3.5,4,4.5,5),ncol= 1)
+latent = pred %*% cho
+
+che = data.frame(observation = as.numeric(as.character(cagu.las$stars)), latent = latent) %>% pivot_longer(cols = 1:2,names_to = "type",values_to = "value")
+ggplot(che) + geom_density(aes(x = value,fill = type),alpha = 0.2)
+```
+
+\qquad Observe above plot, the estimated latent variable is consistent with the observed star ratings, which means our model is valid. Below plot shows that the latent variable are nearly normally distributed, but left-skewed.  
+
+```{r}
+car::qqPlot(latent, id = F)
+```
+
+\qquad Since we ontained the latent variables, now we fit a regression model of this latent variable, note that we will also consider multi-level, Here we do one more step that we check if there is any mix-effet:  
+
+```{r}
+cagu.lat = cagu.las %>% mutate(lat = latent) 
+cagu.lat = cagu.lat %>% 
+  dplyr::select(latitude,longitude,postal_code,names(cagu.lat)[13:37],lat)
+```
+
+```{r}
+fit = lme4::lmer(data = cagu.lat, latent ~  attributes.GoodForKids + attributes.RestaurantsReservations + attributes.GoodForMeal + attributes.BusinessParking + attributes.Caters + attributes.NoiseLevel + attributes.BikeParking + attributes.Ambience + attributes.WiFi + attributes.Alcohol + attributes.RestaurantsGoodForGroups + Chinese + French + Italian + Japanese + (1|postal_code))
+```
+
+```{r}
+exactRLRT(fit)
+```
+
+\qquad The P-value above shows that there is mix-effect. The model we obtained tells us what attibutes will affect the latent variables, all those variables identified are not related to food quality, so we can assume that information related to food quality is put into residuals, so the the residual will be a good indicator of the food quality of a restaurants, so I calculated the residuals and cut it into 10 groups, the index of new group will be the new "star", below is part of the comparison between old "star" and new "star":  
+
+```{r}
+red = predict(fit) - cagu.lat$lat
+red = (red-min(red))/(max(red)-min(red))
+red = cut(red,breaks = 8,ordered_result = T,labels = F)
+red = (red+2)/2
+cops = data.frame(restaurant = cagu.las$name,old = cagu.las$stars, new = red)
+kableExtra::kable(cops[1:10,],booktabs = T,align = "c",format = 'latex') %>% 
+  kableExtra::kable_styling(latex_options = "HOLD_position")
+```
+
+\qquad Look at above table, we can see that after adjustment, some restaurants have lower star ratings, some have higher star ratings, we can go further to check whether it is reasonable:  
+
+```{r}
+dif = with(cops,ifelse(old > new,"Decreased Star","Increased Star"))
+cagu.lat = cagu.lat %>% mutate(dif = dif)
+pl = cagu.lat %>% count(attributes.NoiseLevel,dif)
+
+pl <- pl %>%
+ filter(!(attributes.NoiseLevel %in% "average"))
+ggplot(pl) +
+ aes(x = attributes.NoiseLevel, weight = n) +
+ geom_bar(fill = "#0c4c8a") +
+ facet_wrap(vars(dif), scales = "free")
+```
+
+\qquad Look at above plot, based on the changes of star ratins, I divided restaurants into two groups, one is restaurants received lower new star ratings, another is restaurants received higher new star ratings, for those received lower star ratings, we can find that a lot of them are quite restaurants, so their original star ratings benefit from quite environment, but after we exclude the effect of quite environment, it is reasonable to receive lower star ratings, while load restaurants are just the opposite, so the result is consistent, which is good.  
+
+```{r}
+dif = with(cops,ifelse(old > new,"Decreased Star","Increased Star"))
+cagu.lat = cagu.lat %>% mutate(dif = dif)
+pl = cagu.lat %>% count(attributes.RestaurantsReservations,dif)
+
+ggplot(pl) +
+ aes(x = attributes.RestaurantsReservations, weight = n) +
+ geom_bar(fill = "#0c4c8a") +
+ facet_wrap(vars(dif), scales = "free")
+```
+
+\qquad Whether a restaurants accept reservation will affect its star ratings, accept reservation will increase the star ratings, so after we exclude its effect, for those restaurants that accept reservations will receive lower star ratings, so in above plot, restaurants that received lower new star ratings have a larger proportion of accepting reservation, which is consistent.  
+
+\qquad Above two simple checks validate our model and result.  
+
+## Conclusion
+
+\qquad We successfully iddentified factors that affect the star ratings of resraurants, after that I adjusted the star ratings of restaurants according to those attibutes, the new star ratings are not biased by some attibutes that is not related to food quality, which can provide better guidance to people who value the food quality a lot.  
+
+## Further research direction
+
+\qquad There are still drawbacks of our research, below is the future directions we can improve our research.  
+
++ More sample from different cities, states and different kinds of restaurants;
++ More attributes of restaurants;
+
+
+
